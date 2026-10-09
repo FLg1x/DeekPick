@@ -1,5 +1,6 @@
 ---@meta
 -- IDE declarations only. Do not run this file as a game script.
+-- Native FFI declarations are in ffi.lua; developer guide: FFI.ru.md.
 
 ---@class Vector3
 ---@field x number
@@ -20,6 +21,7 @@
 ---@field velocity Vector3
 ---@field flags integer
 ---@field armor integer
+---@field scoped boolean Local/client-known zoom state; false when unavailable.
 
 ---@class SettingDescriptor
 ---@field category string
@@ -69,15 +71,31 @@
 ---@field victim_id integer? On hit; equals the intended target in this API version.
 ---@field reason string? On miss/unconfirmed, e.g. no_hurt_event/no_weapon_fire/session_reset/overflow.
 
-api = { version = 2, lua = 'Lua 5.5', script = '' }
----Catch ordinary Lua/API errors. Budget exhaustion and allocation failures still disable the script.
+---@class LuaBudget
+---@field instructions_remaining integer Effective current scope; approximate in steps of 1000.
+---@field time_remaining_ms number Effective current scope; wall time, minimum 0.
+---@field native_work_remaining integer Host API/conversion work; direct FFI calls are not API-counted.
+---@field dispatch_instructions_remaining integer Shared dispatch remainder.
+---@field dispatch_time_remaining_ms number Shared dispatch remainder.
+---@field protect_depth integer Current nested protect depth.
+---@field recovering boolean Dispatch exhausted; finish this callback now.
+---@field retryable boolean Parent has not exhausted its budget; does not promise a task will fit.
+---@class LuaBudgetError
+---@field kind 'instructions'|'time'|'native_work'
+---@field scope 'protect'|'dispatch'
+---@field retryable boolean False when dispatch is exhausted.
+api = { version = 2, lua = 'Lua 5.5', script = '', error_codes = { budget_exceeded = 'budget_exceeded' } }
+---Catch ordinary errors and budget exhaustion. Allocation failures remain fatal.
 ---No rollback of settings, draws, UI or other side effects. fn receives no arguments; use a closure.
 ---@param fn fun(): ...
----@param limits? {instructions?: integer, time_ms?: number} Defaults 50000 / 2 ms; shared parent limits still apply.
+---@param limits? {instructions?: integer, time_ms?: number} Defaults 1000000 / 25 ms; maxima 20000000 / 250 ms; parent limits apply.
 ---@return boolean ok
----@return string? error Traceback on failure; nil on success.
----@return ... results Preserves all fn results, including nils, on success.
+---@return string? error Exact 'budget_exceeded' for budget failure; ordinary errors have a traceback; nil on success.
+---@return ... results All fn results including nils on success; LuaBudgetError as third result on budget failure.
 function api.protect(fn, limits) end
+---Budget snapshot; querying it consumes a host API call. Finish callback when recovering=true.
+---@return LuaBudget budget
+function api.budget() end
 buttons = { attack=1, jump=2, duck=4, forward=8, back=16, use=32,
     moveleft=512, moveright=1024, attack2=2048, reload=8192, speed=65536,
     zoom=17179869184, score=8589934592, inspect=34359738368 }
@@ -142,8 +160,9 @@ function client.log_level(level, ...) end
 ---@field memory_bytes integer Lua allocator usage; excludes graphics caches and native allocations.
 ---@class ScriptStats: ExecutionStats
 ---@field invocations integer Completed load/event dispatches since enabling this instance (all handlers together).
----@field protected_errors integer Ordinary errors caught by api.protect since enabling.
+---@field protected_errors integer Ordinary errors and budget failures caught by api.protect since enabling.
 ---@field last ExecutionStats? Previous completed invocation; nil before the first one.
+---@field budget LuaBudget Current budget snapshot.
 ---@return ScriptStats
 function client.stats() end
 ---@return number seconds Monotonic, not game time.
@@ -157,15 +176,43 @@ function client.screen_size() end
 ---@return number seconds
 function client.frametime() end
 
+console = {}
+---Queue game console commands for a following game frame-stage; true means queued.
+---@param command string 1..1024 bytes; NUL forbidden. Game command batches are allowed.
+---@return boolean accepted
+---@return string? reason console_unavailable, queue_full, rate_limited or script_stopping.
+function console.exec(command) end
+---Queue literal text in the game console, with a trailing newline. Percent signs are literal.
+---@param text string Up to 2048 bytes; NUL forbidden.
+---@return boolean accepted
+---@return string? reason
+function console.print(text) end
+---Queue a single quoted say/say_team command, without command injection.
+---@param text string 1..200 UTF-8 bytes; controls, quotes, backslashes and semicolons forbidden.
+---@param team_only? boolean Defaults to false.
+---@return boolean accepted
+---@return string? reason
+function console.say(text, team_only) end
+---Cancel this script's queued requests; requests already handed to the engine are unaffected.
+---@return integer removed
+function console.clear_pending() end
+
 audio = {}
----@param basename string MP3 basename under %LOCALAPPDATA%/skeet/muzon, or sounds/<basename>.mp3 under %LOCALAPPDATA%/skeet/sounds. 256 bytes..256 MiB.
+---Prepare once at top level during script loading. No playback is started.
+---@param basename string MP3/WAV basename in muzon, or sounds/<basename>.mp3/.wav. Encoded file <=64 MiB; decoded PCM <=128 MiB.
+---@return boolean ok
+---@return string? error
+function audio.preload(basename) end
+---Prepared play uses retained PCM/voice. The first unprepared play loads synchronously.
+---@param basename string MP3/WAV basename under %LOCALAPPDATA%/skeet/muzon, or sounds/<basename>.mp3/.wav under %LOCALAPPDATA%/skeet/sounds.
 ---@param loop? boolean Repeat until stopped.
 ---@return boolean ok
 ---@return string? error
 function audio.play(basename, loop) end
----@param percent number Clamped to 0..100.
+---@param percent number Finite; clamped to 0..100. Per-script volume, also accepted before playback.
 ---@return boolean ok
 function audio.volume(percent) end
+---Stop playback but retain prepared sounds until script unload.
 function audio.stop() end
 
 cmd = {}
@@ -190,12 +237,14 @@ function cmd.set_movement(forward, side, up) end
 ---@param pressed boolean
 function cmd.set_button(mask, pressed) end
 ---Explicitly set held/changed/scroll bits for a button mask. Command callbacks only.
+---Attack bits of an already formed native rage shot are preserved in late callbacks.
 ---@param mask integer
 ---@param held boolean
 ---@param changed boolean
 ---@param scroll boolean
 function cmd.set_button_state(mask, held, changed, scroll) end
 ---Mark the current (or a supplied zero-based) input-history entry as primary attack start.
+---Returns false in late callbacks after a native rage shot is formed.
 ---@param index? integer
 ---@return boolean ok
 function cmd.set_attack_start(index) end
@@ -208,8 +257,10 @@ function cmd.set_attack_start(index) end
 ---@return boolean ok
 function cmd.add_subtick(when, forward_delta, side_delta, button, pressed) end
 ---Discard current subtick movement steps before rebuilding them.
+---No effect after a native rage shot is formed.
 function cmd.clear_subticks() end
 ---Set player/render ticks for every input-history entry; command callbacks only.
+---No effect in late callbacks after a native rage shot is formed.
 ---@param player_tick integer
 ---@param render_tick integer
 ---@param player_fraction? number 0..1 exclusive
@@ -341,6 +392,98 @@ function ui.set(id, value) end
 ---@return {key: integer, mode: integer, active: boolean} bind
 function ui.bind(id, key, mode) end
 
+---@class MenuLanguage
+---@field id string
+---@field name string
+---@field font? string Custom font basename in %LOCALAPPDATA%/skeet
+---@field font_size? number Custom menu font size in pixels
+
+---Registers/replaces this script's UTF-8 menu dictionary. Built-ins en/zh-CN are reserved.
+---Removed on script unload/error; missing entries fall back to the original English text.
+---Applies only to Skeet's native interface/editor shell; Lua UI, source and logs stay literal.
+---@param id string ASCII letters/digits/-/_, 1..48 bytes
+---@param name string UTF-8 display name, 1..96 bytes
+---@param translations table<string,string> English visible text => UTF-8 translation
+---@return boolean success False for another owner's ID or registry limit
+function ui.register_language(id, name, translations) end
+---@param id string
+---@return boolean removed Only the owning script can remove a custom dictionary
+function ui.unregister_language(id) end
+---Associates a local TTF/OTF/TTC/OTC file with this script's registered language.
+---CPU validation happens now; GPU font creation is deferred to the next menu frame.
+---nil filename removes the language font, falling back to a menu override or the default.
+---Lua UI/source/logs retain their own fonts.
+---@param id string This script's language ID; built-ins/other owners are protected
+---@param filename? string UTF-8 basename directly in %LOCALAPPDATA%/skeet
+---@param size? number 8..24 pixels, default 11; one size across the native interface
+---@return boolean success
+---@return string? error File/format/ownership/cache failure; previous selection is preserved
+function ui.set_language_font(id, filename, size) end
+---Sets this script's default menu font without changing the selected language.
+---A font attached to the selected language takes priority. Latest live default override wins.
+---@param filename? string Basename in %LOCALAPPDATA%/skeet; nil releases this script's override
+---@param size? number 8..24 pixels, default 11
+---@return boolean success
+---@return string? error
+function ui.set_menu_font(filename, size) end
+---@class MenuFontInfo
+---@field language string Effective language ID
+---@field source 'default'|'menu'|'language'
+---@field filename? string Custom font basename
+---@field size? number Custom font size
+---@return MenuFontInfo font Metadata; GPU creation is deferred
+function ui.get_menu_font() end
+---@class LuaWindowOptions
+---@field key? integer 0 follows Skeet; 1..255 uses a separate VK toggle key
+---@field open? boolean Default true for key=0; false for a separate key
+---@field x? number Default 120
+---@field y? number Default 120
+---@field width? number 180..1600, default 320
+---@field height? number 120..1600, default 360
+---@class LuaWindowInfo
+---@field id string
+---@field title string
+---@field key integer
+---@field open boolean Effective visibility
+---@field follows_menu boolean
+---@field x number
+---@field y number
+---@field width number
+---@field height number
+---Registers an interactive, draggable/resizable script window; at most 8 per script.
+---@param id string Unique script-owned UTF-8 ID, 1..80 bytes
+---@param title string Script-authored UTF-8 title, 1..160 bytes
+---@param options? LuaWindowOptions
+---@return string id
+function ui.create_window(id, title, options) end
+---Moves an existing ui.create control into this script's window; nil restores Config placement.
+---@param control_id string
+---@param window_id? string
+function ui.attach_window(control_id, window_id) end
+---@param id string
+---@param key? integer Query if omitted; 0 follows Skeet, 1..255 independent VK key
+---@return {key: integer, open: boolean, follows_menu: boolean} bind
+function ui.window_bind(id, key) end
+---@param id string
+---@param open boolean Follow-mode windows remain hidden while Skeet is closed
+function ui.set_window_open(id, open) end
+---@param id string
+---@return LuaWindowInfo window
+function ui.get_window(id) end
+---@return string id Effective language ID; en when the saved custom ID is unavailable
+function ui.get_language() end
+---@param id string
+---@return boolean success False for an unknown ID; selection is saved with the config
+function ui.set_language(id) end
+---@param text string
+---@param id? string Defaults to the effective menu language
+---@return string text Unknown language/key returns the original text
+function ui.translate(text, id) end
+---@return string[] keys Sorted English menu text, without ## suffixes
+function ui.get_translation_keys() end
+---@return MenuLanguage[] languages English, Chinese, then custom IDs in alphabetical order
+function ui.get_languages() end
+
 storage = {}
 ---@param key string
 ---@param default? any
@@ -360,7 +503,7 @@ function models.list() end
 ---@param id string ID returned by models.list().
 ---@return string path Virtual model path; this script's choice overrides the built-in agent changer while enabled.
 function models.set(id) end
----Release this script's custom model choice. The original agent selection is restored.
+---Release this script's choice. The next Lua choice, built-in agent or native model is applied on a game frame.
 function models.clear() end
 ---@return string? path This script's current virtual model path, or nil.
 function models.current() end
@@ -369,13 +512,23 @@ function models.current() end
 function models.status() end
 
 chams = {}
----@return string[] targets enemy, enemy_invisible, team, team_invisible, local, arms, weapon.
+---@return string[] targets enemy, enemy_invisible, team, team_invisible, local, arms, weapon, attachments.
 function chams.targets() end
+---@param name string "bloom", "glow" or "flat". Load phase only.
+---@return integer? handle Script-local handle with visible and ignorez variants.
+---@return string? error "material_unavailable" on native failure.
+function chams.builtin_material(name) end
+---@param visible_path string Virtual materials/.../*.vmat or .vmat_c resource path. Load phase only.
+---@param ignorez_path string? Optional separately authored ignorez material path.
+---@return integer? handle Script-local handle; no ignorez variant unless explicitly provided.
+---@return string? error Missing resource/interface errors; invalid arguments raise a Lua error.
+function chams.load_material(visible_path, ignorez_path) end
 ---@param brightness number 0.1..8. Only allowed while the script loads.
 ---@param tint Color RGB baked into a new solidcolor material; alpha is ignored.
 ---@return integer handle Script-local handle, valid until the script is unloaded.
 function chams.create_material(brightness, tint) end
 ---@param target string One of chams.targets().
+---attachments: local owned inventory weapons in thirdperson, including held and holstered pistol/knife models.
 ---@param handle integer? Script-local material handle; nil releases this target.
 ---@param color Color? Render RGBA; required unless handle is nil.
 function chams.set(target, handle, color) end
@@ -469,6 +622,7 @@ function ragebot.claim_command() end
 ---@param record_tick? integer
 ---@return {tick: integer, time: number, hitboxes: table[]}?
 function combat.hitboxes(id, record_tick) end
+---Head probability excludes samples that first hit another hitbox of the target; no per-sample world traces.
 ---@param id integer
 ---@param point Vector3
 ---@param hitbox integer 0..18
@@ -484,7 +638,8 @@ function ui.is_menu_opened() end
 ---paint only. Screen pixels.
 ---@return {x: number, y: number, w: number, h: number}
 function ui.get_menu_rect() end
----paint only. Mouse coordinates are screen pixels; drag only while menu is open.
+---paint only. Current-frame mouse coordinates in screen pixels; clicked is a new left press, down is held.
+---All paint callbacks see the same click. Drag only while the menu is open; stop on release or menu close.
 ---@return {x: number, y: number, down: boolean, clicked: boolean}
 function ui.mouse_state() end
 ---@param src Vector3
@@ -586,6 +741,23 @@ function render.setup_texture_from_memory(bytes) end
 ---@return integer? texture
 ---@return string? error Resource failure code; nil on success.
 function render.setup_texture_rgba(bytes, width, height) end
+---@param width integer 1..4096; total pixels <=1048576.
+---@param height integer
+---@return integer? texture Mutable, private to this script; retained/reused after unload.
+---@return string? error
+function render.create_texture_rgba(width, height) end
+---@param texture integer Handle from render.create_texture_rgba.
+---@param bytes string Exactly width*height*4 RGBA bytes; call before drawing this frame.
+---@return boolean? success
+---@return string? error
+function render.update_texture_rgba(texture, bytes) end
+---@param texture integer Handle from render.create_texture_rgba.
+---@param bytes string Pixel bytes, <=4 MiB; at least pitch*(height-1)+row_bytes, at most pitch*height.
+---@param format 'rgba8'|'bgra8'|'bgrx8'|'rgb565'|'rgb555' 16-bit formats use little-endian words.
+---@param pitch? integer Bytes per source row; default tightly packed; >=width*bytes_per_pixel.
+---@return boolean? success
+---@return string? error Resource error; invalid arguments raise a Lua error.
+function render.update_texture_pixels(texture, bytes, format, pitch) end
 ---@param texture integer Handle returned to this script.
 ---@return integer width Original pixel width.
 ---@return integer height Original pixel height.
